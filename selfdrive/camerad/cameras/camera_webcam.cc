@@ -19,8 +19,8 @@
 #include "selfdrive/common/util.h"
 
 // id of the video capturing device
-const int ROAD_CAMERA_ID = getenv("ROADCAM_ID") ? atoi(getenv("ROADCAM_ID")) : 1;
-const int DRIVER_CAMERA_ID = getenv("DRIVERCAM_ID") ? atoi(getenv("DRIVERCAM_ID")) : 2;
+const int ROAD_CAMERA_ID = util::getenv("ROADCAM_ID", 1);
+const int DRIVER_CAMERA_ID = util::getenv("DRIVERCAM_ID", 2);
 
 #define FRAME_WIDTH  1164
 #define FRAME_HEIGHT 874
@@ -97,7 +97,7 @@ void run_camera(CameraState *s, cv::VideoCapture &video_cap, float *ts) {
 }
 
 static void road_camera_thread(CameraState *s) {
-  set_thread_name("webcam_road_camera_thread");
+  util::set_thread_name("webcam_road_camera_thread");
 
   cv::VideoCapture cap_road(ROAD_CAMERA_ID, cv::CAP_V4L2); // road
   cap_road.set(cv::CAP_PROP_FRAME_WIDTH, 853);
@@ -141,9 +141,9 @@ void driver_camera_thread(CameraState *s) {
 
 void cameras_init(VisionIpcServer *v, MultiCameraState *s, cl_device_id device_id, cl_context ctx) {
   camera_init(v, &s->road_cam, CAMERA_ID_LGC920, 20, device_id, ctx,
-              VISION_STREAM_RGB_BACK, VISION_STREAM_YUV_BACK);
+              VISION_STREAM_RGB_BACK, VISION_STREAM_ROAD);
   camera_init(v, &s->driver_cam, CAMERA_ID_LGC615, 10, device_id, ctx,
-              VISION_STREAM_RGB_FRONT, VISION_STREAM_YUV_FRONT);
+              VISION_STREAM_RGB_FRONT, VISION_STREAM_DRIVER);
   s->pm = new PubMaster({"roadCameraState", "driverCameraState", "thumbnail"});
 }
 
@@ -186,7 +186,7 @@ void cameras_run(MultiCameraState *s) {
   threads.push_back(start_process_thread(s, &s->driver_cam, process_driver_camera));
 
   std::thread t_rear = std::thread(road_camera_thread, &s->road_cam);
-  set_thread_name("webcam_thread");
+  util::set_thread_name("webcam_thread");
   driver_camera_thread(&s->driver_cam);
 
   t_rear.join();

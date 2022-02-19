@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 import sys
 import subprocess
-from azure.storage.blob import BlockBlobService
+from azure.storage.blob import BlockBlobService  # pylint: disable=import-error
 
 from selfdrive.test.test_routes import routes as test_car_models_routes
-from selfdrive.test.process_replay.test_processes import segments as replay_segments
+from selfdrive.test.process_replay.test_processes import original_segments as replay_segments
 from xx.chffr.lib import azureutil  # pylint: disable=import-error
 from xx.chffr.lib.storage import _DATA_ACCOUNT_PRODUCTION, _DATA_ACCOUNT_CI, _DATA_BUCKET_PRODUCTION  # pylint: disable=import-error
 
@@ -17,6 +17,21 @@ SOURCES = [
 DEST_KEY = azureutil.get_user_token(_DATA_ACCOUNT_CI, "openpilotci")
 SOURCE_KEYS = [azureutil.get_user_token(account, bucket) for account, bucket in SOURCES]
 SERVICE = BlockBlobService(_DATA_ACCOUNT_CI, sas_token=DEST_KEY)
+
+def upload_route(path):
+  r, n = path.rsplit("--", 1)
+  destpath = f"{r}/{n}"
+  cmd = [
+    "azcopy",
+    "copy",
+    f"{path}/*",
+    f"https://{_DATA_ACCOUNT_CI}.blob.core.windows.net/openpilotci/{destpath}?{DEST_KEY}",
+    "--recursive=false",
+    "--overwrite=false",
+    "--exclude-pattern=*/dcamera.hevc",
+    "--exclude-pattern=*.mkv",
+  ]
+  subprocess.check_call(cmd)
 
 def sync_to_ci_public(route):
   key_prefix = route.replace('|', '/')
@@ -31,8 +46,8 @@ def sync_to_ci_public(route):
     cmd = [
       "azcopy",
       "copy",
-      "https://{}.blob.core.windows.net/{}/{}?{}".format(source_account, source_bucket, key_prefix, source_key),
-      "https://{}.blob.core.windows.net/{}/{}?{}".format(_DATA_ACCOUNT_CI, "openpilotci", dongle_id, DEST_KEY),
+      f"https://{source_account}.blob.core.windows.net/{source_bucket}/{key_prefix}?{source_key}",
+      f"https://{_DATA_ACCOUNT_CI}.blob.core.windows.net/openpilotci/{dongle_id}?{DEST_KEY}",
       "--recursive=true",
       "--overwrite=false",
       "--exclude-pattern=*/dcamera.hevc",

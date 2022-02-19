@@ -19,21 +19,18 @@ class OffroadHome : public QFrame {
 public:
   explicit OffroadHome(QWidget* parent = 0);
 
-protected:
-  void showEvent(QShowEvent *event) override;
-
 private:
-  QTimer* timer;
+  void showEvent(QShowEvent *event) override;
+  void hideEvent(QHideEvent *event) override;
+  void refresh();
 
+  QTimer* timer;
   QLabel* date;
   QStackedLayout* center_layout;
+  UpdateAlert *update_widget;
   OffroadAlert* alerts_widget;
-  QPushButton* alert_notification;
-
-public slots:
-  void closeAlerts();
-  void openAlerts();
-  void refresh();
+  QPushButton* alert_notif;
+  QPushButton* update_notif;
 };
 
 class HomeWindow : public QWidget {
@@ -46,14 +43,10 @@ signals:
   void openSettings();
   void closeSettings();
 
-  // forwarded signals
-  void displayPowerChanged(bool on);
-  void update(const UIState &s);
-  void offroadTransitionSignal(bool offroad);
-
 public slots:
   void offroadTransition(bool offroad);
   void showDriverView(bool show);
+  void showSidebar(bool show);
 
 protected:
   void mousePressEvent(QMouseEvent* e) override;

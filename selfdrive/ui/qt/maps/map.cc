@@ -3,71 +3,60 @@
 #include <cmath>
 
 #include <QDebug>
+#include <QPainterPath>
+#include <QFileInfo>
 
-#include "selfdrive/common/util.h"
 #include "selfdrive/common/swaglog.h"
 #include "selfdrive/ui/ui.h"
 #include "selfdrive/ui/qt/util.h"
 #include "selfdrive/ui/qt/maps/map_helpers.h"
+#include "selfdrive/ui/qt/request_repeater.h"
 
 
 const int PAN_TIMEOUT = 100;
-const bool DRAW_MODEL_PATH = false;
-const qreal REROUTE_DISTANCE = 25;
+const float MANEUVER_TRANSITION_THRESHOLD = 10;
+
 const float MAX_ZOOM = 17;
 const float MIN_ZOOM = 14;
 const float MAX_PITCH = 50;
 const float MIN_PITCH = 0;
 const float MAP_SCALE = 2;
 
+const QString ICON_SUFFIX = ".png";
 
-MapWindow::MapWindow(const QMapboxGLSettings &settings) : m_settings(settings) {
-  if (DRAW_MODEL_PATH) {
-    sm = new SubMaster({"liveLocationKalman", "modelV2"});
-  } else {
-    sm = new SubMaster({"liveLocationKalman"});
-  }
+MapWindow::MapWindow(const QMapboxGLSettings &settings) :
+  m_settings(settings), velocity_filter(0, 10, 0.05) {
+  sm = new SubMaster({"liveLocationKalman", "navInstruction", "navRoute"});
+
+  // Connect now, so any navRoutes sent while the map is initializing are not dropped
+  sm->update(0);
 
   timer = new QTimer(this);
   QObject::connect(timer, SIGNAL(timeout()), this, SLOT(timerUpdate()));
-
-  recompute_timer = new QTimer(this);
-  recompute_timer->start(1000);
-  QObject::connect(recompute_timer, SIGNAL(timeout()), this, SLOT(recomputeRoute()));
+  timer->start(50);
 
   // Instructions
   map_instructions = new MapInstructions(this);
-  connect(this, &MapWindow::instructionsChanged, map_instructions, &MapInstructions::updateInstructions);
-  connect(this, &MapWindow::distanceChanged, map_instructions, &MapInstructions::updateDistance);
+  QObject::connect(this, &MapWindow::instructionsChanged, map_instructions, &MapInstructions::updateInstructions);
+  QObject::connect(this, &MapWindow::distanceChanged, map_instructions, &MapInstructions::updateDistance);
   map_instructions->setFixedWidth(width());
+  map_instructions->setVisible(false);
 
   map_eta = new MapETA(this);
-  connect(this, &MapWindow::ETAChanged, map_eta, &MapETA::updateETA);
+  QObject::connect(this, &MapWindow::ETAChanged, map_eta, &MapETA::updateETA);
 
-  const int h = 180;
+  const int h = 120;
   map_eta->setFixedHeight(h);
-  map_eta->move(0, 1080 - h);
+  map_eta->move(25, 1080 - h - bdr_s*2);
   map_eta->setVisible(false);
-
-  // Routing
-  QVariantMap parameters;
-  parameters["mapbox.access_token"] = m_settings.accessToken();
-
-  geoservice_provider = new QGeoServiceProvider("mapbox", parameters);
-  routing_manager = geoservice_provider->routingManager();
-  if (routing_manager == nullptr) {
-    qDebug() << geoservice_provider->errorString();
-    assert(routing_manager);
-  }
-  connect(routing_manager, SIGNAL(finished(QGeoRouteReply*)), this, SLOT(routeCalculated(QGeoRouteReply*)));
 
   auto last_gps_position = coordinate_from_param("LastGPSPosition");
   if (last_gps_position) {
     last_position = *last_gps_position;
   }
 
-
   grabGesture(Qt::GestureType::PinchGesture);
+  qDebug() << "MapWindow initialized";
 }
 
 MapWindow::~MapWindow() {
@@ -77,6 +66,7 @@ MapWindow::~MapWindow() {
 void MapWindow::initLayers() {
   // This doesn't work from initializeGL
   if (!m_map->layerExists("modelPathLayer")) {
+    qDebug() << "Initializing modelPathLayer";
     QVariantMap modelPath;
     modelPath["id"] = "modelPathLayer";
     modelPath["type"] = "line";
@@ -87,16 +77,18 @@ void MapWindow::initLayers() {
     m_map->setLayoutProperty("modelPathLayer", "line-cap", "round");
   }
   if (!m_map->layerExists("navLayer")) {
+    qDebug() << "Initializing navLayer";
     QVariantMap nav;
     nav["id"] = "navLayer";
     nav["type"] = "line";
     nav["source"] = "navSource";
     m_map->addLayer(nav, "road-intersection");
-    m_map->setPaintProperty("navLayer", "line-color", QColor("#8cb3d1"));
+    m_map->setPaintProperty("navLayer", "line-color", QColor("#31a1ee"));
     m_map->setPaintProperty("navLayer", "line-width", 7.5);
     m_map->setLayoutProperty("navLayer", "line-cap", "round");
   }
   if (!m_map->layerExists("carPosLayer")) {
+    qDebug() << "Initializing carPosLayer";
     m_map->addImage("label-arrow", QImage("../assets/images/triangle.svg"));
 
     QVariantMap carPos;
@@ -114,219 +106,100 @@ void MapWindow::initLayers() {
 }
 
 void MapWindow::timerUpdate() {
-  initLayers();
+  if (!uiState()->scene.started) {
+    return;
+  }
+
+  update();
 
   sm->update(0);
   if (sm->updated("liveLocationKalman")) {
     auto location = (*sm)["liveLocationKalman"].getLiveLocationKalman();
-    gps_ok = location.getGpsOK();
+    auto pos = location.getPositionGeodetic();
+    auto orientation = location.getCalibratedOrientationNED();
 
-    // Update map location, orientation and zoom on valid localizer output
-    if (location.getStatus() == cereal::LiveLocationKalman::Status::VALID) {
-      auto pos = location.getPositionGeodetic();
-      auto orientation = location.getOrientationNED();
+    localizer_valid = (location.getStatus() == cereal::LiveLocationKalman::Status::VALID) && pos.getValid();
 
+    if (localizer_valid) {
       float velocity = location.getVelocityCalibrated().getValue()[0];
       float bearing = RAD2DEG(orientation.getValue()[2]);
       auto coordinate = QMapbox::Coordinate(pos.getValue()[0], pos.getValue()[1]);
 
       last_position = coordinate;
       last_bearing = bearing;
-
-      if (pan_counter == 0) {
-        m_map->setCoordinate(coordinate);
-        m_map->setBearing(bearing);
-      } else {
-        pan_counter--;
-      }
-
-      if (zoom_counter == 0) {
-        static FirstOrderFilter velocity_filter(velocity, 10, 0.1);
-        m_map->setZoom(util::map_val<float>(velocity_filter.update(velocity), 0, 30, MAX_ZOOM, MIN_ZOOM));
-      } else {
-        zoom_counter--;
-      }
-
-      // Update current location marker
-      auto point = coordinate_to_collection(coordinate);
-      QMapbox::Feature feature1(QMapbox::Feature::PointType, point, {}, {});
-      QVariantMap carPosSource;
-      carPosSource["type"] = "geojson";
-      carPosSource["data"] = QVariant::fromValue<QMapbox::Feature>(feature1);
-      m_map->updateSource("carPosSource", carPosSource);
-
-      // Update model path
-      if (DRAW_MODEL_PATH) {
-        auto model = (*sm)["modelV2"].getModelV2();
-        auto path_points = model_to_collection(location.getCalibratedOrientationECEF(), location.getPositionECEF(), model.getPosition());
-        QMapbox::Feature feature2(QMapbox::Feature::LineStringType, path_points, {}, {});
-        QVariantMap modelPathSource;
-        modelPathSource["type"] = "geojson";
-        modelPathSource["data"] = QVariant::fromValue<QMapbox::Feature>(feature2);
-        m_map->updateSource("modelPathSource", modelPathSource);
-      }
+      velocity_filter.update(velocity);
     }
-
-    // Show route instructions
-    if (segment.isValid()) {
-      auto cur_maneuver = segment.maneuver();
-      auto attrs = cur_maneuver.extendedAttributes();
-      if (cur_maneuver.isValid() && attrs.contains("mapbox.banner_instructions")) {
-        float along_geometry = distance_along_geometry(segment.path(), to_QGeoCoordinate(last_position));
-        float distance = std::max(0.0f, float(segment.distance()) - along_geometry);
-        emit distanceChanged(distance);
-
-        m_map->setPitch(MAX_PITCH); // TODO: smooth pitching based on maneuver distance
-
-        auto banner = attrs["mapbox.banner_instructions"].toList();
-        if (banner.size()) {
-          map_instructions->setVisible(true);
-
-          auto banner_0 = banner[0].toMap();
-          float show_at = banner_0["distance_along_geometry"].toDouble();
-          emit instructionsChanged(banner_0, distance < show_at);
-        }
-      }
-
-      auto next_segment = segment.nextRouteSegment();
-      if (next_segment.isValid()) {
-        auto next_maneuver = next_segment.maneuver();
-        if (next_maneuver.isValid()) {
-          float next_maneuver_distance = next_maneuver.position().distanceTo(to_QGeoCoordinate(last_position));
-          // Switch to next route segment
-          if (next_maneuver_distance < REROUTE_DISTANCE && next_maneuver_distance > last_maneuver_distance) {
-            segment = next_segment;
-
-            recompute_backoff = std::max(0, recompute_backoff - 1);
-            recompute_countdown = 0;
-          }
-          last_maneuver_distance = next_maneuver_distance;
-        }
-      } else {
-        Params().remove("NavDestination");
-
-        // Clear route if driving away from destination
-        float d = segment.maneuver().position().distanceTo(to_QGeoCoordinate(last_position));
-        if (d > REROUTE_DISTANCE) {
-          clearRoute();
-        }
-      }
-    }
-
   }
 
-  update();
+  if (sm->updated("navRoute")) {
+    qWarning() << "Got new navRoute from navd. Opening map:" << allow_open;
 
-  if (!segment.isValid()) {
-    map_instructions->setVisible(false);
+    // Only open the map on setting destination the first time
+    if (allow_open) {
+      setVisible(true); // Show map on destination set/change
+      allow_open = false;
+    }
   }
 
-}
-
-void MapWindow::resizeGL(int w, int h) {
-  map_instructions->setFixedWidth(width());
-}
-
-void MapWindow::initializeGL() {
-  m_map.reset(new QMapboxGL(nullptr, m_settings, size(), 1));
-
-  m_map->setCoordinateZoom(last_position, MAX_ZOOM);
-  m_map->setMargins({0, 350, 0, 50});
-  m_map->setPitch(MIN_PITCH);
-  m_map->setStyleUrl("mapbox://styles/pd0wm/cknuhcgvr0vs817o1akcx6pek"); // Larger fonts
-
-  connect(m_map.data(), SIGNAL(needsRendering()), this, SLOT(update()));
-  timer->start(100);
-}
-
-void MapWindow::paintGL() {
-  if (!isVisible()) return;
-
-  m_map->resize(size() / MAP_SCALE);
-  m_map->setFramebufferObject(defaultFramebufferObject(), size());
-  m_map->render();
-}
-
-static float get_time_typical(const QGeoRouteSegment &segment) {
-  auto maneuver = segment.maneuver();
-  auto attrs = maneuver.extendedAttributes();
-  return attrs.contains("mapbox.duration_typical") ? attrs["mapbox.duration_typical"].toDouble() : segment.travelTime();
-}
-
-
-void MapWindow::recomputeRoute() {
-  bool should_recompute = shouldRecompute();
-  auto new_destination = coordinate_from_param("NavDestination");
-
-  if (!new_destination) {
-    clearRoute();
+  if (m_map.isNull()) {
     return;
   }
 
-  if (*new_destination != nav_destination) {
-    setVisible(true); // Show map on destination set/change
-    should_recompute = true;
+  loaded_once = loaded_once || m_map->isFullyLoaded();
+  if (!loaded_once) {
+    map_instructions->showError("Map Loading");
+    return;
   }
 
-  if (!should_recompute) updateETA(); // ETA is updated after recompute
+  initLayers();
 
-  if (!gps_ok && segment.isValid()) return; // Don't recompute when gps drifts in tunnels
+  if (!localizer_valid) {
+    map_instructions->showError("Waiting for GPS");
+  } else {
+    map_instructions->noError();
 
-  // Only do API request when map is loaded
-  if (!m_map.isNull()) {
-    if (recompute_countdown == 0 && should_recompute) {
-      recompute_countdown = std::pow(2, recompute_backoff);
-      recompute_backoff = std::min(7, recompute_backoff + 1);
-      calculateRoute(*new_destination);
+    // Update current location marker
+    auto point = coordinate_to_collection(*last_position);
+    QMapbox::Feature feature1(QMapbox::Feature::PointType, point, {}, {});
+    QVariantMap carPosSource;
+    carPosSource["type"] = "geojson";
+    carPosSource["data"] = QVariant::fromValue<QMapbox::Feature>(feature1);
+    m_map->updateSource("carPosSource", carPosSource);
+  }
+
+  if (pan_counter == 0) {
+    if (last_position) m_map->setCoordinate(*last_position);
+    if (last_bearing) m_map->setBearing(*last_bearing);
+  } else {
+    pan_counter--;
+  }
+
+  if (zoom_counter == 0) {
+    m_map->setZoom(util::map_val<float>(velocity_filter.x(), 0, 30, MAX_ZOOM, MIN_ZOOM));
+  } else {
+    zoom_counter--;
+  }
+
+  if (sm->updated("navInstruction")) {
+    if (sm->valid("navInstruction")) {
+      auto i = (*sm)["navInstruction"].getNavInstruction();
+      emit ETAChanged(i.getTimeRemaining(), i.getTimeRemainingTypical(), i.getDistanceRemaining());
+
+      if (localizer_valid) {
+        m_map->setPitch(MAX_PITCH); // TODO: smooth pitching based on maneuver distance
+        emit distanceChanged(i.getManeuverDistance()); // TODO: combine with instructionsChanged
+        emit instructionsChanged(i);
+      }
     } else {
-      recompute_countdown = std::max(0, recompute_countdown - 1);
+      m_map->setPitch(MIN_PITCH);
+      clearRoute();
     }
   }
-}
 
-void MapWindow::updateETA() {
-  if (segment.isValid()) {
-    float progress = distance_along_geometry(segment.path(), to_QGeoCoordinate(last_position)) / segment.distance();
-    float total_distance = segment.distance() * (1.0 - progress);
-    float total_time = segment.travelTime() * (1.0 - progress);
-    float total_time_typical = get_time_typical(segment) * (1.0 - progress);
-
-    auto s = segment.nextRouteSegment();
-    while (s.isValid()) {
-      total_distance += s.distance();
-      total_time += s.travelTime();
-      total_time_typical += get_time_typical(s);
-
-      s = s.nextRouteSegment();
-    }
-
-    emit ETAChanged(total_time, total_time_typical, total_distance);
-  }
-}
-
-void MapWindow::calculateRoute(QMapbox::Coordinate destination) {
-  LOGW("calculating route");
-  nav_destination = destination;
-  QGeoRouteRequest request(to_QGeoCoordinate(last_position), to_QGeoCoordinate(destination));
-  request.setFeatureWeight(QGeoRouteRequest::TrafficFeature, QGeoRouteRequest::AvoidFeatureWeight);
-
-  if (last_bearing) {
-    QVariantMap params;
-    int bearing = ((int)(*last_bearing) + 360) % 360;
-    params["bearing"] = bearing;
-    request.setWaypointsMetadata({params});
-  }
-
-  routing_manager->calculateRoute(request);
-}
-
-void MapWindow::routeCalculated(QGeoRouteReply *reply) {
-  LOGW("new route calculated");
-  if (reply->routes().size() != 0) {
-    route = reply->routes().at(0);
-    segment = route.firstRouteSegment();
-
-    auto route_points = coordinate_list_to_collection(route.path());
+  if (sm->rcv_frame("navRoute") != route_rcv_frame) {
+    qWarning() << "Updating navLayer with new route";
+    auto route = (*sm)["navRoute"].getNavRoute();
+    auto route_points = capnp_coordinate_list_to_collection(route.getCoordinates());
     QMapbox::Feature feature(QMapbox::Feature::LineStringType, route_points, {}, {});
     QVariantMap navSource;
     navSource["type"] = "geojson";
@@ -334,51 +207,64 @@ void MapWindow::routeCalculated(QGeoRouteReply *reply) {
     m_map->updateSource("navSource", navSource);
     m_map->setLayoutProperty("navLayer", "visibility", "visible");
 
-    updateETA();
+    route_rcv_frame = sm->rcv_frame("navRoute");
+  }
+}
+
+void MapWindow::resizeGL(int w, int h) {
+  m_map->resize(size() / MAP_SCALE);
+  map_instructions->setFixedWidth(width());
+}
+
+void MapWindow::initializeGL() {
+  m_map.reset(new QMapboxGL(this, m_settings, size(), 1));
+
+  if (last_position) {
+    m_map->setCoordinateZoom(*last_position, MAX_ZOOM);
+  } else {
+    m_map->setCoordinateZoom(QMapbox::Coordinate(64.31990695292795, -149.79038934046247), MIN_ZOOM);
   }
 
-  reply->deleteLater();
+  m_map->setMargins({0, 350, 0, 50});
+  m_map->setPitch(MIN_PITCH);
+  m_map->setStyleUrl("mapbox://styles/commaai/ckr64tlwp0azb17nqvr9fj13s");
+
+  QObject::connect(m_map.data(), &QMapboxGL::mapChanged, [=](QMapboxGL::MapChange change) {
+    if (change == QMapboxGL::MapChange::MapChangeDidFinishLoadingMap) {
+      loaded_once = true;
+    }
+  });
+}
+
+void MapWindow::paintGL() {
+  if (!isVisible() || m_map.isNull()) return;
+  m_map->render();
 }
 
 void MapWindow::clearRoute() {
-  segment = QGeoRouteSegment();
-  nav_destination = QMapbox::Coordinate();
-
   if (!m_map.isNull()) {
     m_map->setLayoutProperty("navLayer", "visibility", "none");
     m_map->setPitch(MIN_PITCH);
   }
 
-  map_instructions->setVisible(false);
+  map_instructions->hideIfNoError();
   map_eta->setVisible(false);
-}
-
-
-bool MapWindow::shouldRecompute() {
-  if (!segment.isValid()) {
-    return true;
-  }
-
-  // Compute closest distance to all line segments in the current path
-  float min_d = REROUTE_DISTANCE + 1;
-  auto path = segment.path();
-  auto cur = to_QGeoCoordinate(last_position);
-  for (size_t i = 0; i < path.size() - 1; i++) {
-    auto a = path[i];
-    auto b = path[i+1];
-    if (a.distanceTo(b) < 1.0) {
-      continue;
-    }
-    min_d = std::min(min_d, minimum_distance(a, b, cur));
-  }
-  return min_d > REROUTE_DISTANCE;
-
-  // TODO: Check for going wrong way in segment
+  allow_open = true;
 }
 
 void MapWindow::mousePressEvent(QMouseEvent *ev) {
   m_lastPos = ev->localPos();
   ev->accept();
+}
+
+void MapWindow::mouseDoubleClickEvent(QMouseEvent *ev) {
+  if (last_position) m_map->setCoordinate(*last_position);
+  if (last_bearing) m_map->setBearing(*last_bearing);
+  m_map->setZoom(util::map_val<float>(velocity_filter.x(), 0, 30, MAX_ZOOM, MIN_ZOOM));
+  update();
+
+  pan_counter = 0;
+  zoom_counter = 0;
 }
 
 void MapWindow::mouseMoveEvent(QMouseEvent *ev) {
@@ -387,6 +273,7 @@ void MapWindow::mouseMoveEvent(QMouseEvent *ev) {
   if (!delta.isNull()) {
     pan_counter = PAN_TIMEOUT;
     m_map->moveBy(delta / MAP_SCALE);
+    update();
   }
 
   m_lastPos = ev->localPos();
@@ -404,6 +291,8 @@ void MapWindow::wheelEvent(QWheelEvent *ev) {
   }
 
   m_map->scaleBy(1 + factor, ev->pos() / MAP_SCALE);
+  update();
+
   zoom_counter = PAN_TIMEOUT;
   ev->accept();
 }
@@ -428,12 +317,15 @@ void MapWindow::pinchTriggered(QPinchGesture *gesture) {
   if (changeFlags & QPinchGesture::ScaleFactorChanged) {
     // TODO: figure out why gesture centerPoint doesn't work
     m_map->scaleBy(gesture->scaleFactor(), {width() / 2.0 / MAP_SCALE, height() / 2.0 / MAP_SCALE});
+    update();
     zoom_counter = PAN_TIMEOUT;
   }
 }
 
 void MapWindow::offroadTransition(bool offroad) {
-  if (!offroad) {
+  if (offroad) {
+    clearRoute();
+  } else {
     auto dest = coordinate_from_param("NavDestination");
     setVisible(dest.has_value());
   }
@@ -441,6 +333,7 @@ void MapWindow::offroadTransition(bool offroad) {
 }
 
 MapInstructions::MapInstructions(QWidget * parent) : QWidget(parent) {
+  is_rhd = Params().getBool("IsRHD");
   QHBoxLayout *main_layout = new QHBoxLayout(this);
   main_layout->setContentsMargins(11, 50, 11, 11);
   {
@@ -452,27 +345,29 @@ MapInstructions::MapInstructions(QWidget * parent) : QWidget(parent) {
   }
 
   {
-    QWidget *w = new QWidget;
-    QVBoxLayout *layout = new QVBoxLayout(w);
+    QVBoxLayout *layout = new QVBoxLayout;
 
     distance = new QLabel;
-    distance->setStyleSheet(R"(font-size: 75px; )");
+    distance->setStyleSheet(R"(font-size: 90px;)");
     layout->addWidget(distance);
 
     primary = new QLabel;
-    primary->setStyleSheet(R"(font-size: 50px;)");
+    primary->setStyleSheet(R"(font-size: 60px;)");
     primary->setWordWrap(true);
     layout->addWidget(primary);
 
     secondary = new QLabel;
-    secondary->setStyleSheet(R"(font-size: 40px;)");
+    secondary->setStyleSheet(R"(font-size: 50px;)");
     secondary->setWordWrap(true);
     layout->addWidget(secondary);
 
-    lane_layout = new QHBoxLayout;
-    layout->addLayout(lane_layout);
+    lane_widget = new QWidget;
+    lane_widget->setFixedHeight(125);
 
-    main_layout->addWidget(w);
+    lane_layout = new QHBoxLayout(lane_widget);
+    layout->addWidget(lane_widget);
+
+    main_layout->addLayout(layout);
   }
 
   setStyleSheet(R"(
@@ -489,9 +384,10 @@ MapInstructions::MapInstructions(QWidget * parent) : QWidget(parent) {
 }
 
 void MapInstructions::updateDistance(float d) {
+  d = std::max(d, 0.0f);
   QString distance_str;
 
-  if (QUIState::ui_state.scene.is_metric) {
+  if (uiState()->scene.is_metric) {
     if (d > 500) {
       distance_str.setNum(d / 1000, 'f', 1);
       distance_str += " km";
@@ -500,8 +396,8 @@ void MapInstructions::updateDistance(float d) {
       distance_str += " m";
     }
   } else {
-    float miles = d * METER_2_MILE;
-    float feet = d * METER_2_FOOT;
+    float miles = d * METER_TO_MILE;
+    float feet = d * METER_TO_FOOT;
 
     if (feet > 500) {
       distance_str.setNum(miles, 'f', 1);
@@ -512,144 +408,157 @@ void MapInstructions::updateDistance(float d) {
     }
   }
 
+  distance->setAlignment(Qt::AlignLeft);
   distance->setText(distance_str);
 }
 
-void MapInstructions::updateInstructions(QMap<QString, QVariant> banner, bool full) {
-  // Need multiple calls to adjustSize for it to properly resize
-  // seems like it takes a little bit of time for the images to change and
-  // the size can only be changed afterwards
-  adjustSize();
+void MapInstructions::showError(QString error_text) {
+  primary->setText("");
+  distance->setText(error_text);
+  distance->setAlignment(Qt::AlignCenter);
 
-  if (banner == last_banner) return;
-  QString primary_str, secondary_str;
+  secondary->setVisible(false);
+  icon_01->setVisible(false);
 
-  auto p = banner["primary"].toMap();
-  primary_str += p["text"].toString();
+  this->error = true;
+  lane_widget->setVisible(false);
 
-  // Show arrow with direction
-  if (p.contains("type")) {
-    QString fn = "../assets/navigation/direction_" + p["type"].toString();
-    if (p.contains("modifier")) {
-      fn += "_" + p["modifier"].toString();
-    }
-    fn +=  + ".png";
-    fn = fn.replace(' ', '_');
+  setVisible(true);
+}
 
-    QPixmap pix(fn);
-    icon_01->setPixmap(pix.scaledToWidth(200, Qt::SmoothTransformation));
-    icon_01->setSizePolicy(QSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed));
-  }
+void MapInstructions::noError() {
+  error = false;
+}
 
-  // Parse components (e.g. lanes, exit number)
-  auto components = p["components"].toList();
-  QString icon_fn;
-  for (auto &c : components) {
-    auto cc = c.toMap();
-    if (cc["type"].toString() == "icon") {
-      icon_fn = cc["imageBaseURL"].toString() + "@3x.png";
-    }
-  }
+void MapInstructions::updateInstructions(cereal::NavInstruction::Reader instruction) {
+  // Word wrap widgets need fixed width
+  primary->setFixedWidth(width() - 250);
+  secondary->setFixedWidth(width() - 250);
 
-  if (banner.contains("secondary") && full) {
-    auto s = banner["secondary"].toMap();
-    secondary_str += s["text"].toString();
-  }
 
-  clearLayout(lane_layout);
-  bool has_lanes = false;
-
-  if (banner.contains("sub") && full) {
-    auto s = banner["sub"].toMap();
-    auto components = s["components"].toList();
-    for (auto &c : components) {
-      auto cc = c.toMap();
-      if (cc["type"].toString() == "lane") {
-        has_lanes = true;
-
-        bool left = false;
-        bool straight = false;
-        bool right = false;
-        bool active = cc["active"].toBool();
-
-        for (auto &dir : cc["directions"].toList()) {
-          auto d = dir.toString();
-          left |= d.contains("left");
-          straight |= d.contains("straight");
-          right |= d.contains("right");
-        }
-
-        // TODO: Make more images based on active direction and combined directions
-        QString fn = "../assets/navigation/direction_";
-        if (left) {
-          fn += "turn_left";
-        } else if (right) {
-          fn += "turn_right";
-        } else if (straight) {
-          fn += "turn_straight";
-        }
-
-        QPixmap pix(fn + ".png");
-        auto icon = new QLabel;
-        icon->setPixmap(pix.scaledToWidth(active ? 125 : 75, Qt::SmoothTransformation));
-        icon->setSizePolicy(QSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed));
-        lane_layout->addWidget(icon);
-      }
-    }
-  }
+  // Show instruction text
+  QString primary_str = QString::fromStdString(instruction.getManeuverPrimaryText());
+  QString secondary_str = QString::fromStdString(instruction.getManeuverSecondaryText());
 
   primary->setText(primary_str);
   secondary->setVisible(secondary_str.length() > 0);
   secondary->setText(secondary_str);
-  adjustSize();
-  last_banner = banner;
+
+  // Show arrow with direction
+  QString type = QString::fromStdString(instruction.getManeuverType());
+  QString modifier = QString::fromStdString(instruction.getManeuverModifier());
+  if (!type.isEmpty()) {
+    QString fn = "../assets/navigation/direction_" + type;
+    if (!modifier.isEmpty()) {
+      fn += "_" + modifier;
+    }
+    fn += ICON_SUFFIX;
+    fn = fn.replace(' ', '_');
+
+    // for rhd, reflect direction and then flip
+    if (is_rhd) {
+      if (fn.contains("left")) {
+        fn.replace(QString("left"), QString("right"));
+      } else if (fn.contains("right")) {
+        fn.replace(QString("right"), QString("left"));
+      }
+    }
+
+    QPixmap pix(fn);
+    if (is_rhd) {
+      pix = pix.transformed(QTransform().scale(-1, 1));
+    }
+    icon_01->setPixmap(pix.scaledToWidth(200, Qt::SmoothTransformation));
+    icon_01->setSizePolicy(QSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed));
+    icon_01->setVisible(true);
+  }
+
+  // Show lanes
+  bool has_lanes = false;
+  clearLayout(lane_layout);
+  for (auto const &lane: instruction.getLanes()) {
+    has_lanes = true;
+    bool active = lane.getActive();
+
+    // TODO: only use active direction if active
+    bool left = false, straight = false, right = false;
+    for (auto const &direction: lane.getDirections()) {
+      left |= direction == cereal::NavInstruction::Direction::LEFT;
+      right |= direction == cereal::NavInstruction::Direction::RIGHT;
+      straight |= direction == cereal::NavInstruction::Direction::STRAIGHT;
+    }
+
+    // TODO: Make more images based on active direction and combined directions
+    QString fn = "../assets/navigation/direction_";
+    if (left) {
+      fn += "turn_left";
+    } else if (right) {
+      fn += "turn_right";
+    } else if (straight) {
+      fn += "turn_straight";
+    }
+
+    auto icon = new QLabel;
+    int wh = active ? 125 : 75;
+    icon->setPixmap(loadPixmap(fn + ICON_SUFFIX, {wh, wh}, Qt::IgnoreAspectRatio));
+    icon->setSizePolicy(QSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed));
+    lane_layout->addWidget(icon);
+  }
+  lane_widget->setVisible(has_lanes);
+
+  show();
+  resize(sizeHint());
+}
+
+
+void MapInstructions::hideIfNoError() {
+  if (!error) {
+    hide();
+  }
 }
 
 MapETA::MapETA(QWidget * parent) : QWidget(parent) {
   QHBoxLayout *main_layout = new QHBoxLayout(this);
-  main_layout->setContentsMargins(20, 25, 20, 25);
+  main_layout->setContentsMargins(40, 25, 40, 25);
 
   {
-    QVBoxLayout *layout = new QVBoxLayout;
+    QHBoxLayout *layout = new QHBoxLayout;
     eta = new QLabel;
     eta->setAlignment(Qt::AlignCenter);
+    eta->setStyleSheet("font-weight:600");
 
-    auto eta_unit = new QLabel("eta");
+    eta_unit = new QLabel;
     eta_unit->setAlignment(Qt::AlignCenter);
 
-    layout->addStretch();
     layout->addWidget(eta);
     layout->addWidget(eta_unit);
-    layout->addStretch();
     main_layout->addLayout(layout);
   }
-  main_layout->addSpacing(30);
+  main_layout->addSpacing(40);
   {
-    QVBoxLayout *layout = new QVBoxLayout;
+    QHBoxLayout *layout = new QHBoxLayout;
     time = new QLabel;
     time->setAlignment(Qt::AlignCenter);
 
     time_unit = new QLabel;
     time_unit->setAlignment(Qt::AlignCenter);
 
-    layout->addStretch();
     layout->addWidget(time);
     layout->addWidget(time_unit);
-    layout->addStretch();
     main_layout->addLayout(layout);
   }
-  main_layout->addSpacing(30);
+  main_layout->addSpacing(40);
   {
-    QVBoxLayout *layout = new QVBoxLayout;
+    QHBoxLayout *layout = new QHBoxLayout;
     distance = new QLabel;
     distance->setAlignment(Qt::AlignCenter);
+    distance->setStyleSheet("font-weight:600");
+
     distance_unit = new QLabel;
     distance_unit->setAlignment(Qt::AlignCenter);
 
-    layout->addStretch();
     layout->addWidget(distance);
     layout->addWidget(distance_unit);
-    layout->addStretch();
     main_layout->addLayout(layout);
   }
 
@@ -657,7 +566,7 @@ MapETA::MapETA(QWidget * parent) : QWidget(parent) {
     * {
       color: white;
       font-family: "Inter";
-      font-size: 55px;
+      font-size: 70px;
     }
   )");
 
@@ -669,14 +578,20 @@ MapETA::MapETA(QWidget * parent) : QWidget(parent) {
 
 
 void MapETA::updateETA(float s, float s_typical, float d) {
-  setVisible(true);
+  if (d < MANEUVER_TRANSITION_THRESHOLD) {
+    hide();
+    return;
+  }
 
   // ETA
   auto eta_time = QDateTime::currentDateTime().addSecs(s).time();
   if (params.getBool("NavSettingTime24h")) {
     eta->setText(eta_time.toString("HH:mm"));
+    eta_unit->setText("eta");
   } else {
-    eta->setText(eta_time.toString("h:mm a"));
+    auto t = eta_time.toString("h:mm a").split(' ');
+    eta->setText(t[0]);
+    eta_unit->setText(t[1]);
   }
 
   // Remaining time
@@ -689,30 +604,53 @@ void MapETA::updateETA(float s, float s_typical, float d) {
     time_unit->setText("hr");
   }
 
+  QString color;
   if (s / s_typical > 1.5) {
-    time_unit->setStyleSheet(R"(color: #DA3025; )");
-    time->setStyleSheet(R"(color: #DA3025; )");
+    color = "#DA3025";
   } else if (s / s_typical > 1.2) {
-    time_unit->setStyleSheet(R"(color: #DAA725; )");
-    time->setStyleSheet(R"(color: #DAA725; )");
+    color = "#DAA725";
   } else {
-    time_unit->setStyleSheet(R"(color: #25DA6E; )");
-    time->setStyleSheet(R"(color: #25DA6E; )");
+    color = "#25DA6E";
   }
+
+  time->setStyleSheet(QString(R"(color: %1; font-weight:600;)").arg(color));
+  time_unit->setStyleSheet(QString(R"(color: %1;)").arg(color));
 
   // Distance
   QString distance_str;
   float num = 0;
-  if (QUIState::ui_state.scene.is_metric) {
+  if (uiState()->scene.is_metric) {
     num = d / 1000.0;
     distance_unit->setText("km");
   } else {
-    num = d * METER_2_MILE;
+    num = d * METER_TO_MILE;
     distance_unit->setText("mi");
   }
 
   distance_str.setNum(num, 'f', num < 100 ? 1 : 0);
   distance->setText(distance_str);
 
+  show();
   adjustSize();
+  repaint();
+  adjustSize();
+
+  // Rounded corners
+  const int radius = 25;
+  const auto r = rect();
+
+  // Top corners rounded
+  QPainterPath path;
+  path.setFillRule(Qt::WindingFill);
+  path.addRoundedRect(r, radius, radius);
+
+  // Bottom corners not rounded
+  path.addRect(r.marginsRemoved(QMargins(0, radius, 0, 0)));
+
+  // Set clipping mask
+  QRegion mask = QRegion(path.simplified().toFillPolygon().toPolygon());
+  setMask(mask);
+
+  // Center
+  move(static_cast<QWidget*>(parent())->width() / 2 - width() / 2, 1080 - height() - bdr_s*2);
 }

@@ -66,13 +66,16 @@ typedef struct CameraState {
   unsigned int max_gain;
   float cur_exposure_frac, cur_gain_frac;
   int cur_gain, cur_integ_lines;
+
+  float measured_grey_fraction;
+  float target_grey_fraction;
+
   std::atomic<float> digital_gain;
   camera_apply_exposure_func apply_exposure;
 
   // rear camera only,used for focusing
   unique_fd actuator_fd;
   std::atomic<float> focus_err;
-  std::atomic<float> last_sag_acc_z;
   std::atomic<float> lens_true_pos;
   std::atomic<int> self_recover; // af recovery counter, neg is patience, pos is active
   uint16_t cur_step_pos;
