@@ -60,6 +60,7 @@ FW_VERSIONS = {
       b'\xa5 \x19\x02\x00',
       b'\xa5 !\002\000',
       b'\xf1\x82\xa5 \x19\x02\x00',
+      b'\xf1\x00\xb2\x06\x04',
     ],
     (Ecu.eps, 0x746, None): [
       b'\x85\xc0\xd0\x00',
@@ -67,10 +68,17 @@ FW_VERSIONS = {
       b'\x95\xc0\xd0\x00',
     ],
     (Ecu.fwdCamera, 0x787, None): [
+      b'\x00\x00d\xb9\x00\x00\x00\x00',
       b'\x00\x00d\xb9\x1f@ \x10',
       b'\000\000e~\037@ \'',
       b'\x00\x00e@\x1f@ $',
     ],
+    (Ecu.fwdCamera, 0x7c4, None): [
+      b'\xf1\x00\xac\x04\x00',
+    ],
+    (Ecu.fwdRadar, 0x7d0, None): [
+      b'\xf1\x00\x00\x00\x02',
+    ],    
     (Ecu.engine, 0x7e0, None): [
       b'\xbb,\xa0t\a',
       b'\xf1\x82\xbb,\xa0t\x87',
@@ -82,6 +90,7 @@ FW_VERSIONS = {
       b'\x00\xfe\xf7\x00\x00',
       b'\001\xfe\xf9\000\000',
       b'\x01\xfe\xf7\x00\x00',
+      b'\xf1\x00\xa4\x10@',
     ],
   },
   CAR.IMPREZA: {
