@@ -90,7 +90,6 @@ FW_VERSIONS = {
       b'\x00\xfe\xf7\x00\x00',
       b'\001\xfe\xf9\000\000',
       b'\x01\xfe\xf7\x00\x00',
-      b'\xf1\x00\xa4\x10@',
     ],
   },
   CAR.IMPREZA: {
