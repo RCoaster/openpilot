@@ -30,10 +30,10 @@ class CarInterface(CarInterfaceBase):
       ret.wheelbase = 2.89
       ret.centerToFront = ret.wheelbase * 0.5
       ret.steerRatio = 13.5
-      ret.steerActuatorDelay = 0.27   # end-to-end angle controller
+      ret.steerActuatorDelay = 0.24   # end-to-end angle controller
       ret.lateralTuning.pid.kf = 0.00003
-      ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0., 41.], [0., 41.]]
-      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.0025, .215], [0.00025, .0215]]
+      ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0., 40.], [0., 40.]]
+      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.0025, .2125], [0.00025, .02125]]
 
     if candidate == CAR.IMPREZA:
       ret.mass = 1568. + STD_CARGO_KG
