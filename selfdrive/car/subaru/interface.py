@@ -32,17 +32,17 @@ class CarInterface(CarInterfaceBase):
     ret.steerActuatorDelay = 0.1
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
-    if candidate == CAR.ASCENT:
-      ret.mass = 2231. + STD_CARGO_KG
+   if candidate == CAR.ASCENT:
+      ret.mass = 2031. + STD_CARGO_KG
       ret.wheelbase = 2.89
       ret.centerToFront = ret.wheelbase * 0.5
-      ret.steerRatio = 15
-      ret.steerActuatorDelay = 0.34   # end-to-end angle controller
+      ret.steerRatio = 13.5
+      ret.steerActuatorDelay = 0.245   # end-to-end angle controller
       ret.lateralTuning.init('pid')
-      ret.lateralTuning.pid.kf = 0.000041
-      ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0., 20., 41.], [0., 20., 41.]]
-      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.02, 0.19, 0.3685], [0.0042, 0.028, 0.05299]]
-
+      ret.lateralTuning.pid.kf = 0.00003
+      ret.lateralTuning.pid.kiBP, ret.lateralTuning.pid.kpBP = [[0., 41.], [0., 41.]]
+      ret.lateralTuning.pid.kpV, ret.lateralTuning.pid.kiV = [[0.0025, 0.2127], [0.00025, 0.02127]]
+     
     elif candidate == CAR.IMPREZA:
       ret.mass = 1568. + STD_CARGO_KG
       ret.wheelbase = 2.67
