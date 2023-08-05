@@ -32,7 +32,7 @@ class CarInterface(CarInterfaceBase):
     ret.steerActuatorDelay = 0.1
     CarInterfaceBase.configure_torque_tune(candidate, ret.lateralTuning)
 
-   if candidate == CAR.ASCENT:
+    if candidate == CAR.ASCENT:
       ret.mass = 2031. + STD_CARGO_KG
       ret.wheelbase = 2.89
       ret.centerToFront = ret.wheelbase * 0.5
