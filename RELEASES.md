@@ -1,4 +1,4 @@
-Version 0.9.4 (2023-07-27)
+Version 0.9.4 (2023-07-27)*
 ========================
 * Navigate on openpilot in Experimental mode
   * When navigation has a destination, openpilot will input the map information into the model, which provides useful context to help the model understand the scene
